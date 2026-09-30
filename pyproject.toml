@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tribble-upscaler"
+version = "0.1.0"
+description = "Local AI video upscaler with custom model support and a Qt GUI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.23",
+    "torch>=2.0",
+    "spandrel>=0.3",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+onnx = ["onnxruntime>=1.16"]
+safetensors = ["safetensors>=0.4"]
+ffmpeg = ["imageio-ffmpeg>=0.4.9"]
+all = ["PySide6>=6.5", "onnxruntime>=1.16", "safetensors>=0.4", "imageio-ffmpeg>=0.4.9"]
+dev = ["pytest>=7", "onnx>=1.14"]
+
+[project.scripts]
+tribble = "tribble.cli:main"
+
+[project.gui-scripts]
+tribble-gui = "tribble.gui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["tribble*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

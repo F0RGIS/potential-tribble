@@ -1,0 +1,7 @@
+{
+  "processing": {"bit_depth": 16},
+  "output": {
+    "size_mode": "model", "container": "mkv", "codec": "ffv1", "crf": null, "preset": "",
+    "pixel_format": "yuv444p10le", "copy_audio": true, "copy_subtitles": true
+  }
+}
