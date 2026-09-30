@@ -4,6 +4,8 @@ Examples::
 
     tribble upscale in.mp4 -m models/realesr-animevideov3.pth
     tribble upscale in.mp4 -m a.pth -m b.onnx --strength 1 0.6 --tile 512 -o out.mkv
+    tribble upscale in.mp4 -m 2x.pth --interp ~/.tribble/models/flownet_v4.26.pkl --interp-fps 60
+    tribble upscale in.mp4 --interp builtin:minterpolate --interp-factor 2   # interpolate only
     tribble upscale *.mp4 --preset presets/anime-fast.json --out-dir upscaled/
     tribble models
     tribble info models/4x_foo.safetensors
@@ -52,6 +54,18 @@ def _add_upscale_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--pre-scale", type=float, help="downscale factor before the model, e.g. 0.5")
     g.add_argument("--pre-filters", help='ffmpeg filters on decode, e.g. "yadif,hqdn3d=2"')
 
+    g = p.add_argument_group("frame interpolation")
+    g.add_argument("--interp", metavar="MODEL",
+                   help="interpolation model: RIFE .pkl/.pth, builtin:blend or builtin:minterpolate (ffmpeg)")
+    g.add_argument("--interp-factor", type=float, help="multiply the frame rate (default 2)")
+    g.add_argument("--interp-fps", type=float, help="target frame rate instead of a factor, e.g. 60")
+    g.add_argument("--interp-order", choices=["before", "after"], help="interpolate before or after upscaling")
+    g.add_argument("--scene-threshold", type=float,
+                   help="scene-cut sensitivity 0..1 (frames are repeated across cuts); 0 disables")
+    g.add_argument("--flow-scale", type=float, help="RIFE flow resolution: 0.5 for 4K, 1 default, 2 for tiny")
+    g.add_argument("--ensemble", action="store_true", help="RIFE ensemble mode (slower, slightly better)")
+    g.add_argument("--no-interp", action="store_true", help="disable interpolation set by a preset")
+
     g = p.add_argument_group("output")
     g.add_argument("--scale", type=float, help="final scale relative to the source")
     g.add_argument("--width", type=int, help="final width (keeps aspect)")
@@ -83,6 +97,21 @@ def build_config(a: argparse.Namespace) -> JobConfig:
     elif a.strength:
         for step, s in zip(cfg.models, a.strength):
             step.strength = s
+
+    it = cfg.interpolation
+    if a.interp:
+        it.enabled, it.model = True, a.interp
+    if a.interp_fps:
+        it.mode, it.target_fps = "fps", a.interp_fps
+    elif a.interp_factor:
+        it.mode, it.factor = "factor", a.interp_factor
+    _set(it, "order", a.interp_order)
+    _set(it, "scene_threshold", a.scene_threshold)
+    _set(it, "flow_scale", a.flow_scale)
+    if a.ensemble:
+        it.ensemble = True
+    if a.no_interp:
+        it.enabled = False
 
     p, i, o = cfg.processing, cfg.input, cfg.output
     _set(p, "device", a.device)
@@ -137,11 +166,11 @@ def _set(obj, attr: str, value) -> None:
 
 def cmd_upscale(a: argparse.Namespace) -> int:
     from .inference import Upscaler
-    from .pipeline import Cancelled, default_output_path, run_job
+    from .pipeline import Cancelled, default_output_path, load_interpolator_for, run_job
 
     cfg = build_config(a)
-    if not cfg.models:
-        print("error: no model given (-m or a preset with models)", file=sys.stderr)
+    if not cfg.has_work():
+        print("error: nothing to do: give an upscaling model (-m) and/or --interp", file=sys.stderr)
         return 2
     if a.output and len(a.inputs) > 1:
         print("error: -o only works with a single input; use --out-dir", file=sys.stderr)
@@ -151,12 +180,15 @@ def cmd_upscale(a: argparse.Namespace) -> int:
         print(f"Saved preset to {a.save_preset}")
 
     upscaler = Upscaler.from_config(cfg, print)
+    interpolator = load_interpolator_for(cfg, print)
     cancel = threading.Event()
     failures = 0
     for inp in a.inputs:
         out = Path(a.output) if a.output else default_output_path(inp, cfg, a.out_dir)
         try:
-            run_job(inp, out, cfg, upscaler, progress=_ProgressBar(), log_fn=print, cancel=cancel)
+            bar = _ProgressBar()
+            run_job(inp, out, cfg, upscaler, progress=bar, log_fn=bar.log, cancel=cancel,
+                    interpolator=interpolator)
         except (KeyboardInterrupt, Cancelled):
             cancel.set()
             print("\nCancelled.", file=sys.stderr)
@@ -168,7 +200,16 @@ def cmd_upscale(a: argparse.Namespace) -> int:
 
 
 class _ProgressBar:
+    open_line = False
+
+    def log(self, msg: str) -> None:
+        if self.open_line:
+            sys.stderr.write("\n")
+            self.open_line = False
+        print(msg)
+
     def __call__(self, pr) -> None:
+        self.open_line = pr.frame < pr.total
         width = 30
         filled = int(width * pr.fraction)
         eta = f"{int(pr.eta // 60):d}:{int(pr.eta % 60):02d}"
@@ -182,6 +223,7 @@ class _ProgressBar:
 
 
 def cmd_models(a: argparse.Namespace) -> int:
+    from .interp import BUILTIN_INTERPOLATORS
     from .models import BUILTIN_MODELS, model_dirs, scan_models
     from .models.plugins import load_plugins
     from .models.registry import plugin_dirs
@@ -191,21 +233,41 @@ def cmd_models(a: argparse.Namespace) -> int:
     for d in dirs:
         print(f"  {'*' if d.is_dir() else ' '} {d}")
     entries = scan_models(dirs)
-    print(f"\nModels ({len(entries)}):")
-    for e in entries:
-        print(f"  {e.name:<40} {e.size_bytes / 1e6:8.1f} MB  {e.path}")
+    for kind, title in (("upscale", "Upscaling models"), ("interpolation", "Interpolation models")):
+        sel = [e for e in entries if e.kind == kind]
+        print(f"\n{title} ({len(sel)}):")
+        for e in sel:
+            print(f"  {e.name:<40} {e.size_bytes / 1e6:8.1f} MB  {e.path}")
     print("\nBuiltins:")
-    for b in BUILTIN_MODELS:
+    for b in BUILTIN_MODELS + BUILTIN_INTERPOLATORS:
         print(f"  {b}")
     plugins = load_plugins(plugin_dirs())
     print(f"\nArch plugins ({len(plugins)}):")
     for name, pl in plugins.items():
-        print(f"  {name:<20} {pl.path}")
+        print(f"  {name:<20} {pl.kind:<14} {pl.path}")
     return 0
 
 
 def cmd_info(a: argparse.Namespace) -> int:
+    from .interp import load_interpolator
+    from .interp.rife import clean_state_dict, is_rife
     from .models import load_model
+    from .models.loader import _read_state_dict
+
+    if not a.model.startswith("builtin:") and not a.model.endswith(".onnx"):
+        try:
+            obj = _read_state_dict(Path(a.model).expanduser(), a.unsafe_pickle)
+            rife = isinstance(obj, dict) and is_rife(clean_state_dict(obj))
+        except Exception:
+            rife = False
+        if rife:
+            m = load_interpolator(a.model, device=a.device or "auto")
+            print(m.describe())
+            print("  kind:         frame interpolation (RIFE)")
+            print(f"  pad multiple: {m.pad_multiple}")
+            for k, v in m.info.items():
+                print(f"  {k}: {v}")
+            return 0
 
     m = load_model(a.model, device=a.device or "auto", half=False, allow_unsafe_pickle=a.unsafe_pickle)
     print(m.describe())
@@ -232,7 +294,8 @@ def cmd_download(a: argparse.Namespace) -> int:
 
     if not a.names:
         for m in CATALOG.values():
-            print(f"  {m.key:<28} x{m.scale}  {m.description}")
+            tag = "interp" if m.kind == "interpolation" else f"x{m.scale}"
+            print(f"  {m.key:<28} {tag:<7} {m.description}")
         return 0
     for name in a.names:
         def prog(got, total):

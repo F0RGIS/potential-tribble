@@ -1,6 +1,6 @@
 # Tribble Upscaler
 
-Tribble is a local AI video upscaler with a desktop GUI and a scriptable CLI. It runs any
+Tribble is a local AI video upscaler and frame interpolator with a desktop GUI and a scriptable CLI. It runs any
 super-resolution model you give it: community `.pth` and `.safetensors` models, ONNX,
 TorchScript, `torch.export` files, or your own architecture through a small Python plugin.
 Everything runs on your machine; nothing is uploaded.
@@ -29,6 +29,22 @@ Everything runs on your machine; nothing is uploaded.
   out of memory, the tile size shrinks automatically.
 - 8-bit or 16-bit frame pipes, for clean 10-bit output.
 - Decoding, inference and encoding run in parallel threads.
+
+**Frame interpolation**
+- Uses **RIFE v4.2 to v4.26**, including the lite and heavy variants. One implementation reads
+  each checkpoint's layout from its weights, and its output matches the reference ports exactly
+  for all 36 variants.
+- Raise the frame rate by a factor (2×, 3×, 2.5×, ...) or to an exact target (24 → 60,
+  23.976 → 59.94). Output timing is exact, so audio stays in sync.
+- Scene-cut detection repeats the last frame at a cut instead of morphing between two shots.
+- Choose whether to interpolate before or after upscaling. You can also set RIFE's flow scale
+  (0.5 for 4K) and use ensemble mode.
+- Other methods: ffmpeg `minterpolate` (motion-compensated, no AI), a plain cross-fade, or your
+  own model through an [interpolation plugin](plugins/README.md).
+- Can run with no upscaling model, to interpolate only.
+- **Preview in-between** (F6) compares a plain cross-fade with the interpolated frame.
+
+![Interpolation](docs/interpolation.png)
 
 **Video**
 - ffmpeg pre-filters (deinterlace, denoise, crop and so on) and a pre-downscale, both applied
@@ -69,6 +85,7 @@ For ONNX models on an NVIDIA GPU, install `onnxruntime-gpu` in place of `onnxrun
 ```bash
 tribble download                          # list the built-in model catalog
 tribble download realesr-animevideov3     # tiny and fast: a good first test
+tribble download rife-v4.26               # frame interpolation
 tribble-gui                               # or: python -m tribble gui
 ```
 
@@ -77,7 +94,9 @@ In the GUI:
 1. Drop videos into **Inputs**.
 2. Pick a model in **Model chain**.
 3. Press **Preview frame** (F5) to compare the before and after.
-4. Press **Start**.
+4. Optionally, turn on the **Interpolation** tab and check an in-between frame with **Preview
+   in-between** (F6).
+5. Press **Start**.
 
 ### CLI
 
@@ -95,6 +114,15 @@ tribble upscale old.avi -m model.onnx --pre-filters "bwdif,hqdn3d" \
 
 # batch a folder with a preset, preview 5 seconds only
 tribble upscale clips/*.mp4 --preset presets/anime-fast-hevc.json --start 60 --end 65 --out-dir out/
+
+# upscale 2x and interpolate to 60 fps with RIFE; keep scene cuts sharp
+tribble upscale in.mp4 -m 2x_model.pth --interp ~/.tribble/models/flownet_v4.26.pkl --interp-fps 60
+
+# interpolation only: triple the frame rate, flow at half resolution (for 4K sources)
+tribble upscale in4k.mkv --interp ~/.tribble/models/flownet_v4.22.lite.pkl --interp-factor 3 --flow-scale 0.5
+
+# no AI: ffmpeg motion interpolation after upscaling
+tribble upscale in.mp4 -m model.pth --interp builtin:minterpolate --interp-factor 2
 
 tribble models              # list models, folders and plugins
 tribble info model.pth      # what was detected: arch, scale, channels, ...
@@ -123,6 +151,12 @@ Set `TRIBBLE_HOME` to move `~/.tribble`.
   upscaler.
 - **Too "plastic"?** Lower the model's strength to between 0.6 and 0.8, and/or add grain with
   the post-filter `noise=alls=3:allf=t`.
+- **Interpolation order:** interpolating *after* upscaling is usually faster, because the
+  upscaler, often the slowest step, then runs only on the original frames. Interpolating
+  *before* means the upscaler also cleans up small interpolation artifacts. For 4K frames, set
+  the flow scale to 0.5.
+- **Scene cuts:** if cuts get morphed, lower the scene-cut threshold (e.g. to 0.08). If fast
+  action gets flagged as a cut, raise it.
 - **Color:** frames are converted using the source's color matrix, and the output is tagged
   BT.709 for HD and BT.601 for SD, unless you choose a matrix yourself. HDR/PQ tone handling is
   not implemented.
@@ -138,6 +172,7 @@ The code is organised like this:
 
 - `tribble/models/`: loading, plugins and the registry
 - `tribble/inference.py`: tiling and model chains
+- `tribble/interp/`: RIFE, frame-rate conversion and scene-cut detection
 - `tribble/video.py`: ffmpeg I/O
 - `tribble/pipeline.py`: running jobs
 - `tribble/cli.py`: the command line interface

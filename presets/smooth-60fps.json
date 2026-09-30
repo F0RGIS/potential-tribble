@@ -1,0 +1,12 @@
+{
+  "interpolation": {
+    "enabled": true,
+    "model": "~/.tribble/models/flownet_v4.26.pkl",
+    "mode": "fps",
+    "target_fps": 60,
+    "order": "after",
+    "scene_threshold": 0.12,
+    "flow_scale": 1.0
+  },
+  "output": {"container": "mkv", "codec": "libx265", "crf": 20, "preset": "slow", "pixel_format": "yuv420p10le"}
+}

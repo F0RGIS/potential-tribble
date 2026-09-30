@@ -14,6 +14,8 @@ architectures that spandrel doesn't know about. A plugin module defines::
         return model                       # or {"model": m, "scale": 4, ...}
 
 ``options`` is the ``"options"`` object of the model's JSON sidecar (or ``{}``).
+Set ``KIND = "interpolation"`` for frame-interpolation models; their module is
+called as ``model(img0, img1, t)`` and returns the in-between frame.
 When ``build`` returns a dict it may contain ``model`` plus any of ``scale``,
 ``in_channels``, ``out_channels``, ``pad_multiple``, ``supports_half``.
 Anything missing is probed automatically.
@@ -38,6 +40,7 @@ class ArchPlugin:
     path: Path
     build: Callable
     detect: Optional[Callable] = None
+    kind: str = "upscale"  # upscale | interpolation
 
 
 def load_plugins(dirs: Iterable[Path]) -> Dict[str, ArchPlugin]:
@@ -59,7 +62,8 @@ def load_plugins(dirs: Iterable[Path]) -> Dict[str, ArchPlugin]:
                 log.warning("Plugin %s has no build() function; skipped", path)
                 continue
             name = str(getattr(mod, "NAME", path.stem))
-            plugins[name] = ArchPlugin(name, path, build, getattr(mod, "detect", None))
+            kind = str(getattr(mod, "KIND", "upscale")).lower()
+            plugins[name] = ArchPlugin(name, path, build, getattr(mod, "detect", None), kind)
     return plugins
 
 

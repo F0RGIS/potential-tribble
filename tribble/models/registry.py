@@ -8,7 +8,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-MODEL_EXTENSIONS = {".pth", ".pt", ".ckpt", ".bin", ".safetensors", ".onnx", ".jit", ".torchscript", ".pt2"}
+MODEL_EXTENSIONS = {
+    ".pth", ".pt", ".ckpt", ".bin", ".safetensors", ".onnx", ".jit", ".torchscript", ".pt2", ".pkl",
+}
+# File names that mark frame-interpolation models (or set "kind" in the sidecar).
+INTERP_NAME_HINTS = ("rife", "flownet", "ifnet", "interp")
 
 BUILTIN_MODELS = [
     "builtin:bicubic@2",
@@ -62,6 +66,15 @@ class ModelEntry:
     def spec(self) -> str:
         return str(self.path)
 
+    @property
+    def kind(self) -> str:
+        """``upscale`` or ``interpolation`` (sidecar "kind", else guessed from the file name)."""
+        k = self.sidecar.get("kind")
+        if k in ("upscale", "interpolation"):
+            return k
+        name = self.path.name.lower()
+        return "interpolation" if any(h in name for h in INTERP_NAME_HINTS) else "upscale"
+
 
 def find_sidecar(path: Path) -> Optional[Path]:
     """``foo.pth.json`` takes precedence over ``foo.json``."""
@@ -82,7 +95,12 @@ def read_sidecar(path: Path) -> Dict:
         return {}
 
 
-def scan_models(dirs: Optional[List[Path]] = None) -> List[ModelEntry]:
+def scan_models(dirs: Optional[List[Path]] = None, kind: Optional[str] = None) -> List[ModelEntry]:
+    entries = _scan(dirs)
+    return [e for e in entries if kind is None or e.kind == kind]
+
+
+def _scan(dirs: Optional[List[Path]]) -> List[ModelEntry]:
     entries: List[ModelEntry] = []
     for d in dirs if dirs is not None else model_dirs():
         if not d.is_dir():

@@ -28,7 +28,9 @@ from ..config import ModelStep
 from ..models import BUILTIN_MODELS, ModelEntry
 from ..video import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 
-MODEL_FILTER = "Models (*.pth *.pt *.pt2 *.ckpt *.bin *.safetensors *.onnx *.jit *.torchscript);;All files (*)"
+MODEL_FILTER = (
+    "Models (*.pth *.pt *.pt2 *.pkl *.ckpt *.bin *.safetensors *.onnx *.jit *.torchscript);;All files (*)"
+)
 
 
 def array_to_qimage(a: np.ndarray) -> QImage:
@@ -65,9 +67,11 @@ class CompareView(QWidget):
         self._pan_start: Optional[QPointF] = None
         self._dragging_split = False
         self.message = "Pick an input file and press Preview"
+        self.labels = ("Before", "After")
 
-    def set_images(self, before: np.ndarray, after: np.ndarray) -> None:
+    def set_images(self, before: np.ndarray, after: np.ndarray, labels=("Before", "After")) -> None:
         self.before, self.after = array_to_qimage(before), array_to_qimage(after)
+        self.labels = tuple(labels)
         self.message = ""
         self.update()
 
@@ -129,8 +133,8 @@ class CompareView(QWidget):
         elif self.mode == "Side by side":
             p.drawImage(r, self.before)
             p.drawImage(self._image_rect(1), self.after)
-            self._label(p, r, "Before", Qt.AlignLeft)
-            self._label(p, self._image_rect(1), "After", Qt.AlignLeft)
+            self._label(p, r, self.labels[0], Qt.AlignLeft)
+            self._label(p, self._image_rect(1), self.labels[1], Qt.AlignLeft)
         else:
             sx = r.left() + r.width() * self.split
             p.save()
@@ -143,8 +147,8 @@ class CompareView(QWidget):
             p.restore()
             p.setPen(QPen(QColor(255, 255, 255, 220), 2))
             p.drawLine(QPointF(sx, r.top()), QPointF(sx, r.bottom()))
-            self._label(p, r, "Before", Qt.AlignLeft)
-            self._label(p, r, "After", Qt.AlignRight)
+            self._label(p, r, self.labels[0], Qt.AlignLeft)
+            self._label(p, r, self.labels[1], Qt.AlignRight)
         if self.message:
             self._label(p, QRectF(self.rect()), self.message, Qt.AlignHCenter)
 

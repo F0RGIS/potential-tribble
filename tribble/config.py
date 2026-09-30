@@ -78,11 +78,35 @@ class OutputSettings:
 
 
 @dataclass
+class InterpolationSettings:
+    """Frame interpolation (raising the frame rate)."""
+
+    enabled: bool = False
+    # RIFE checkpoint path, builtin:blend, builtin:minterpolate (ffmpeg), or a plugin model
+    model: str = ""
+    mode: str = "factor"  # factor | fps
+    factor: float = 2.0  # output fps = source fps x factor
+    target_fps: float = 60.0  # used when mode == "fps"
+    order: str = "after"  # interpolate "before" or "after" upscaling
+    scene_threshold: float = 0.12  # repeat frames across cuts instead of morphing; 0 = off
+    flow_scale: float = 1.0  # RIFE flow resolution: 0.5 for 4K, 2.0 for tiny sources
+    ensemble: bool = False  # RIFE: average forward/backward passes (slower, a bit better)
+
+
+@dataclass
 class JobConfig:
     models: List[ModelStep] = field(default_factory=list)
     processing: ProcessingSettings = field(default_factory=ProcessingSettings)
     input: InputSettings = field(default_factory=InputSettings)
     output: OutputSettings = field(default_factory=OutputSettings)
+    interpolation: InterpolationSettings = field(default_factory=InterpolationSettings)
+
+    @property
+    def interpolating(self) -> bool:
+        return self.interpolation.enabled and bool(self.interpolation.model)
+
+    def has_work(self) -> bool:
+        return any(s.enabled for s in self.models) or self.interpolating
 
     # ---- serialisation -------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
@@ -101,6 +125,9 @@ class JobConfig:
             processing=ProcessingSettings(**_known(ProcessingSettings, data.get("processing", {}))),
             input=InputSettings(**_known(InputSettings, data.get("input", {}))),
             output=OutputSettings(**_known(OutputSettings, data.get("output", {}))),
+            interpolation=InterpolationSettings(
+                **_known(InterpolationSettings, data.get("interpolation", {}))
+            ),
         )
 
     def save(self, path: str | Path) -> None:

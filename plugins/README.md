@@ -59,3 +59,15 @@ layout.
 ```
 
 See [`example_srcnn.py`](example_srcnn.py) for a complete, working example.
+
+## Interpolation plugins
+
+Frame-interpolation architectures work the same way. Add `KIND = "interpolation"` to the
+plugin, and have `build()` return a module that is called like this:
+
+```python
+out = model(img0, img1, t)   # (B,3,H,W) in [0,1], float t in (0,1) -> in-between frame
+```
+
+The dict form accepts `model`, `pad_multiple` and `supports_half`. RIFE v4.2 to v4.26 is built
+in and needs no plugin.
