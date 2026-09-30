@@ -13,16 +13,18 @@ from PySide6.QtCore import QObject, Signal
 
 from ..config import JobConfig
 from ..inference import Upscaler
-from ..pipeline import Cancelled, Progress, run_job
-from ..video import read_frame_at
+from ..pipeline import Cancelled, load_interpolator_for, run_job
+from ..video import read_frame_at, read_frames_at
 
 
 class UpscalerCache:
-    """Keeps the last loaded model chain so previews and jobs don't reload it."""
+    """Keeps the last loaded models so previews and jobs don't reload them."""
 
     def __init__(self):
         self._key: Optional[str] = None
         self._upscaler: Optional[Upscaler] = None
+        self._ikey: Optional[str] = None
+        self._interp = None
         self._lock = threading.Lock()
 
     @staticmethod
@@ -39,9 +41,22 @@ class UpscalerCache:
                 self._key = key
             return self._upscaler
 
+    def get_interpolator(self, cfg: JobConfig, log_fn):
+        if not cfg.interpolating:
+            return None
+        d = cfg.to_dict()
+        key = json.dumps({"interp": d["interpolation"], "processing": d["processing"]}, sort_keys=True)
+        with self._lock:
+            if key != self._ikey:
+                self._interp = None
+                self._interp = load_interpolator_for(cfg, log_fn)
+                self._ikey = key
+            return self._interp
+
     def clear(self) -> None:
         with self._lock:
             self._upscaler, self._key = None, None
+            self._interp, self._ikey = None, None
 
 
 class JobWorker(QObject):
@@ -63,6 +78,7 @@ class JobWorker(QObject):
         try:
             try:
                 upscaler = self.cache.get(self.cfg, self.log.emit)
+                interpolator = self.cache.get_interpolator(self.cfg, self.log.emit)
             except Exception as exc:
                 self.log.emit(f"ERROR loading models: {exc}")
                 for i in range(len(self.jobs)):
@@ -74,7 +90,8 @@ class JobWorker(QObject):
                     continue
                 self.file_started.emit(i)
                 try:
-                    run_job(src, dst, self.cfg, upscaler, self.progress.emit, self.log.emit, self.cancel_event)
+                    run_job(src, dst, self.cfg, upscaler, self.progress.emit, self.log.emit, self.cancel_event,
+                            interpolator=interpolator)
                     self.file_finished.emit(i, True, dst)
                 except Cancelled:
                     self.log.emit(f"Cancelled: {Path(src).name}")
@@ -106,6 +123,41 @@ class PreviewWorker(QObject):
             t0 = time.perf_counter()
             after = upscaler.upscale_array(before)
             self.ready.emit(_to8(before), _to8(after), time.perf_counter() - t0)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class InterpPreviewWorker(QObject):
+    """Interpolates the midpoint between the frame at ``t`` and the next one."""
+
+    log = Signal(str)
+    ready = Signal(object, object, float)  # cross-fade (np), interpolated (np), seconds
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, path: str, t: float, cfg: JobConfig, cache: UpscalerCache):
+        super().__init__()
+        self.path, self.t, self.cfg, self.cache = path, t, cfg, cache
+
+    def run(self) -> None:
+        import time
+
+        import torch
+
+        try:
+            model = self.cache.get_interpolator(self.cfg, self.log.emit)
+            if model is None:
+                raise RuntimeError("Choose an AI interpolation model (ffmpeg minterpolate has no preview)")
+            a, b = read_frames_at(self.path, self.t, 2, self.cfg.input, self.cfg.processing.bit_depth)
+            ta, tb = Upscaler.to_tensor(a), Upscaler.to_tensor(b)
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                mid = model.infer(model.prepare(ta), model.prepare(tb), 0.5).float().cpu()
+                blend = (ta + tb) / 2
+            secs = time.perf_counter() - t0
+            self.ready.emit(_to8(Upscaler.to_numpy(blend)), _to8(Upscaler.to_numpy(mid)), secs)
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:

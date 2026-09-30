@@ -346,22 +346,38 @@ class FrameReader:
         return (err or b"").decode(errors="replace")
 
 
-def read_frame_at(path: str, t: float, settings: Optional[InputSettings] = None, bit_depth: int = 8) -> np.ndarray:
-    """Grab a single (pre-filtered) frame at time ``t`` for previews."""
+def read_frames_at(
+    path: str, t: float, count: int = 1, settings: Optional[InputSettings] = None, bit_depth: int = 8
+) -> List[np.ndarray]:
+    """Grab ``count`` consecutive (pre-filtered) frames starting at time ``t`` for previews."""
     info = probe(path)
     base = settings or InputSettings()
+    if count > 1 and info.is_image:
+        raise FFmpegError("Need a video (not a still image) for this preview")
+    # Stay far enough from the end that `count` frames exist.
+    latest = max(info.duration - (count + 1) / max(info.fps, 1.0), 0.0)
     s = InputSettings(
-        start_time=None if info.is_image else max(t, 0.0),
-        max_frames=1,
+        start_time=None if info.is_image else min(max(t, 0.0), latest),
+        max_frames=count,
         pre_scale=base.pre_scale,
         pre_filters=base.pre_filters,
     )
     reader = FrameReader(info, s, bit_depth)
-    frame = reader.read()
+    frames = []
+    for _ in range(count):
+        f = reader.read()
+        if f is None:
+            break
+        frames.append(f)
     err = reader.close()
-    if frame is None:
-        raise FFmpegError(f"Could not decode a frame at {t:.2f}s: {err.strip()[-400:]}")
-    return frame
+    if len(frames) < count:
+        raise FFmpegError(f"Could not decode {count} frame(s) at {t:.2f}s: {err.strip()[-400:]}")
+    return frames
+
+
+def read_frame_at(path: str, t: float, settings: Optional[InputSettings] = None, bit_depth: int = 8) -> np.ndarray:
+    """Grab a single (pre-filtered) frame at time ``t`` for previews."""
+    return read_frames_at(path, t, 1, settings, bit_depth)[0]
 
 
 # --------------------------------------------------------------------------
@@ -431,6 +447,7 @@ class FrameWriter:
         start_time: Optional[float] = None,
         duration: Optional[float] = None,
         final_size: Optional[Tuple[int, int]] = None,
+        pre_filters: str = "",
     ):
         self.width, self.height = width, height
         self.bit_depth = 16 if bit_depth == 16 else 8
@@ -467,7 +484,7 @@ class FrameWriter:
         if use_subs:
             cmd += ["-map", "1:s?"]
 
-        vf = []
+        vf = [pre_filters] if pre_filters else []
         if final_size and final_size != (width, height):
             vf.append(f"scale={fw}:{fh}:flags={settings.resize_filter or 'lanczos'}")
         if settings.post_filters.strip():

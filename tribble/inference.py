@@ -32,9 +32,7 @@ class Upscaler:
     """Runs a chain of models over single frames."""
 
     def __init__(self, steps: Sequence[ChainStep], settings: Optional[ProcessingSettings] = None):
-        if not steps:
-            raise ValueError("At least one model is required")
-        self.steps = list(steps)
+        self.steps = list(steps)  # may be empty: frames pass through unchanged
         self.settings = settings or ProcessingSettings()
         # Tile sizes can shrink at runtime after an out-of-memory error.
         self._tile = [self._initial_tile(s) for s in self.steps]
@@ -43,10 +41,10 @@ class Upscaler:
     @classmethod
     def from_config(cls, cfg: JobConfig, log_fn: Callable[[str], None] = log.info) -> "Upscaler":
         steps = [s for s in cfg.models if s.enabled]
-        if not steps:
+        if not steps and not cfg.interpolating:
             raise ValueError("No enabled models in the chain")
         p = cfg.processing
-        plugins = load_plugins(plugin_dirs())
+        plugins = load_plugins(plugin_dirs()) if steps else {}
         if plugins:
             log_fn(f"Loaded arch plugins: {', '.join(plugins)}")
         chain = []
@@ -69,7 +67,7 @@ class Upscaler:
 
     @property
     def device(self) -> torch.device:
-        return self.steps[0].model.device
+        return self.steps[0].model.device if self.steps else torch.device("cpu")
 
     def _initial_tile(self, step: ChainStep) -> int:
         if step.tile_size is not None:
@@ -88,10 +86,11 @@ class Upscaler:
 
     @staticmethod
     def to_numpy(t: torch.Tensor, bit_depth: int = 8) -> np.ndarray:
-        t = t.squeeze(0).clamp_(0, 1).permute(1, 2, 0)
+        # Not in-place: the same tensor may be emitted more than once (repeated frames).
+        t = t.squeeze(0).clamp(0, 1).permute(1, 2, 0)
         if bit_depth == 16:
-            return t.mul_(65535.0).round_().to(torch.int32).cpu().numpy().astype(np.uint16)
-        return t.mul_(255.0).round_().to(torch.uint8).cpu().numpy()
+            return (t * 65535.0).round_().to(torch.int32).cpu().numpy().astype(np.uint16)
+        return (t * 255.0).round_().to(torch.uint8).cpu().numpy()
 
     # ---- processing ---------------------------------------------------
     @torch.inference_mode()

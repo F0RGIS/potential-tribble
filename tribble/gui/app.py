@@ -43,13 +43,14 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..catalog import CATALOG
-from ..config import InputSettings, JobConfig, OutputSettings, ProcessingSettings
+from ..config import InputSettings, InterpolationSettings, JobConfig, OutputSettings, ProcessingSettings
+from ..interp import BUILTIN_INTERPOLATORS, FFMPEG_METHOD
 from ..models import available_devices, model_dirs, scan_models
 from ..models.registry import USER_DIR, plugin_dirs, preset_dirs
 from ..pipeline import default_output_path
 from ..video import CODECS, CONTAINERS, IMAGE_EXTENSIONS, PIXEL_FORMATS, VIDEO_EXTENSIONS, probe
-from .widgets import CompareView, FileQueue, ModelChainTable
-from .workers import DownloadWorker, JobWorker, PreviewWorker, UpscalerCache
+from .widgets import MODEL_FILTER, CompareView, FileQueue, ModelChainTable
+from .workers import DownloadWorker, InterpPreviewWorker, JobWorker, PreviewWorker, UpscalerCache
 
 PRE_FILTER_EXAMPLES = [
     "",
@@ -115,6 +116,26 @@ def _combo_value(cb: QComboBox) -> str:
             return str(cb.itemData(idx))
         return text
     return str(cb.currentData())
+
+
+def _set_model_combo(cb: QComboBox, value: str) -> None:
+    """Select a model by spec, matching resolved paths; add it as a custom entry if unknown."""
+    idx = cb.findData(value)
+    if idx < 0:
+        for i in range(cb.count()):
+            d = cb.itemData(i)
+            try:
+                if d and not str(d).startswith("builtin:") and \
+                        Path(d).expanduser().resolve() == Path(value).expanduser().resolve():
+                    idx = i
+                    break
+            except OSError:
+                pass
+    if idx < 0:
+        cb.addItem(value if value.startswith("builtin:") else Path(value).stem, value)
+        cb.setItemData(cb.count() - 1, value, Qt.ToolTipRole)
+        idx = cb.count() - 1
+    cb.setCurrentIndex(idx)
 
 
 def _spin(lo, hi, value, step=1, special: Optional[str] = None, suffix="") -> QSpinBox:
@@ -248,6 +269,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._processing_tab(), "Processing")
         tabs.addTab(self._input_tab(), "Input")
         tabs.addTab(self._output_tab(), "Output")
+        tabs.addTab(self._interp_tab(), "Interpolation")
         lv.addWidget(tabs, 1)
 
         g = QGroupBox("Presets")
@@ -290,6 +312,14 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.time_slider, 1)
         bar.addWidget(self.time_label)
         bar.addWidget(self.preview_btn)
+        self.interp_preview_btn = QPushButton("Preview in-between")
+        self.interp_preview_btn.setShortcut(QKeySequence("F6"))
+        self.interp_preview_btn.setToolTip(
+            "Interpolate the midpoint between the frame at the slider and the next one (F6).\n"
+            "Before = plain cross-fade, After = interpolation model."
+        )
+        self.interp_preview_btn.clicked.connect(self.run_interp_preview)
+        bar.addWidget(self.interp_preview_btn)
         bar.addWidget(self.mode_combo)
         for text, tip, slot in (
             ("Fit", "Fit to window (double-click)", lambda: self.view.reset_view()),
@@ -455,6 +485,86 @@ class MainWindow(QMainWindow):
         self._update_size_widgets()
         return w
 
+    def _interp_tab(self) -> QWidget:
+        w = QWidget()
+        f = QFormLayout(w)
+        self.interp_on = QCheckBox("Enable frame interpolation (raise the frame rate)")
+        self.interp_on.toggled.connect(self._update_interp_widgets)
+        f.addRow(self.interp_on)
+        row = QHBoxLayout()
+        self.interp_model = QComboBox()
+        self.interp_model.setEditable(True)
+        self.interp_model.setInsertPolicy(QComboBox.NoInsert)
+        self.interp_model.setMinimumContentsLength(18)
+        self.interp_model.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.interp_model.setToolTip(
+            "RIFE v4.2 - v4.26 checkpoints (Models → Download…), builtin:blend (cross-fade),\n"
+            "builtin:minterpolate (ffmpeg motion interpolation, no AI) or an interpolation plugin"
+        )
+        self.interp_model.currentIndexChanged.connect(self._update_interp_widgets)
+        row.addWidget(self.interp_model, 1)
+        b = QToolButton()
+        b.setText("…")
+        b.setToolTip("Browse for an interpolation model")
+        b.clicked.connect(self._browse_interp_model)
+        row.addWidget(b)
+        f.addRow("Model:", row)
+        self.interp_mode = _combo([("factor", "Multiply frame rate"), ("fps", "Target frame rate")])
+        self.interp_mode.currentIndexChanged.connect(self._update_interp_widgets)
+        f.addRow("Mode:", self.interp_mode)
+        self.interp_factor = _dspin(1.0, 16.0, 2.0, 1.0, 2, suffix=" ×")
+        f.addRow("Factor:", self.interp_factor)
+        self.interp_fps = _dspin(1.0, 480.0, 60.0, 1.0, 3, suffix=" fps")
+        self.interp_fps.setToolTip("e.g. 60, 59.94, 120 (NTSC rates like 59.94 are handled exactly)")
+        f.addRow("Target:", self.interp_fps)
+        self.interp_order = _combo([
+            ("after", "After upscaling (usually faster)"),
+            ("before", "Before upscaling (interpolate at source resolution)"),
+        ])
+        f.addRow("Order:", self.interp_order)
+        self.scene_thr = _dspin(0.0, 1.0, 0.12, 0.01, 3, special="off")
+        self.scene_thr.setToolTip(
+            "Scene-cut detection: frames are repeated across cuts instead of morphing two shots.\n"
+            "Lower = more sensitive."
+        )
+        f.addRow("Scene-cut threshold:", self.scene_thr)
+        self.flow_scale = _combo([("0.25", "0.25 (8K)"), ("0.5", "0.5 (4K)"), ("1.0", "1.0 (default)"),
+                                  ("2.0", "2.0 (small / low-res)")])
+        self.flow_scale.setToolTip("Resolution at which RIFE estimates motion. Lower = faster, handles big motion")
+        f.addRow("Flow scale:", self.flow_scale)
+        self.ensemble = QCheckBox("Ensemble (RIFE; slower, slightly smoother; not all versions)")
+        f.addRow(self.ensemble)
+        self.interp_info = QLabel("")
+        self.interp_info.setWordWrap(True)
+        self.interp_info.setStyleSheet("color: gray")
+        f.addRow(self.interp_info)
+        for wdg in (self.interp_factor, self.interp_fps):
+            wdg.valueChanged.connect(self._update_interp_widgets)
+        return w
+
+    def _browse_interp_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose interpolation model", "", MODEL_FILTER)
+        if path:
+            _set_model_combo(self.interp_model, path)
+
+    def _update_interp_widgets(self) -> None:
+        on = self.interp_on.isChecked()
+        is_ff = _combo_value(self.interp_model) == FFMPEG_METHOD
+        by_fps = self.interp_mode.currentData() == "fps"
+        for wdg in (self.interp_model, self.interp_mode, self.interp_order, self.interp_info):
+            wdg.setEnabled(on)
+        self.interp_factor.setEnabled(on and not by_fps)
+        self.interp_fps.setEnabled(on and by_fps)
+        self.scene_thr.setEnabled(on and not is_ff)
+        self.flow_scale.setEnabled(on and not is_ff)
+        self.ensemble.setEnabled(on and not is_ff)
+        src = getattr(self, "_media_fps", 0.0)
+        if on and src:
+            out = self.interp_fps.value() if by_fps else src * self.interp_factor.value()
+            self.interp_info.setText(f"Selected input: {src:.3f} fps → {out:.3f} fps")
+        else:
+            self.interp_info.setText("")
+
     def _build_menu(self) -> None:
         m = self.menuBar().addMenu("&File")
         self._action(m, "Add files…", self.add_files, "Ctrl+O")
@@ -537,6 +647,17 @@ class MainWindow(QMainWindow):
                 image_sequence=self.png_seq.isChecked(),
                 overwrite=self.overwrite.isChecked(),
             ),
+            interpolation=InterpolationSettings(
+                enabled=self.interp_on.isChecked(),
+                model=_combo_value(self.interp_model),
+                mode=self.interp_mode.currentData(),
+                factor=self.interp_factor.value(),
+                target_fps=self.interp_fps.value(),
+                order=self.interp_order.currentData(),
+                scene_threshold=self.scene_thr.value(),
+                flow_scale=float(self.flow_scale.currentData()),
+                ensemble=self.ensemble.isChecked(),
+            ),
         )
 
     def apply_config(self, cfg: JobConfig) -> None:
@@ -581,6 +702,21 @@ class MainWindow(QMainWindow):
         self.overwrite.setChecked(o.overwrite)
         self._update_size_widgets()
 
+        it = cfg.interpolation
+        self.interp_on.setChecked(it.enabled)
+        if it.model:
+            _set_model_combo(self.interp_model, it.model)
+        _set_combo(self.interp_mode, it.mode)
+        self.interp_factor.setValue(it.factor)
+        self.interp_fps.setValue(it.target_fps)
+        _set_combo(self.interp_order, it.order)
+        self.scene_thr.setValue(it.scene_threshold)
+        for i in range(self.flow_scale.count()):
+            if abs(float(self.flow_scale.itemData(i)) - float(it.flow_scale)) < 1e-6:
+                self.flow_scale.setCurrentIndex(i)
+        self.ensemble.setChecked(it.ensemble)
+        self._update_interp_widgets()
+
     def _update_size_widgets(self) -> None:
         mode = self.size_mode.currentData()
         self.out_scale.setEnabled(mode == "scale")
@@ -617,12 +753,15 @@ class MainWindow(QMainWindow):
         try:
             info = probe(path)
             self._media_duration = 0.0 if info.is_image else info.duration
+            self._media_fps = 0.0 if info.is_image else info.fps
             self.input_info.setText(info.summary())
             self.time_slider.setEnabled(not info.is_image)
         except Exception as exc:
             self._media_duration = 0.0
+            self._media_fps = 0.0
             self.input_info.setText(f"Could not read: {exc}")
         self._update_time_label()
+        self._update_interp_widgets()
 
     def _preview_time(self) -> float:
         return self._media_duration * self.time_slider.value() / 1000.0
@@ -642,7 +781,19 @@ class MainWindow(QMainWindow):
 
     def refresh_models(self) -> None:
         entries = scan_models(model_dirs(self._extra_model_dirs()))
-        self.chain.set_available(entries)
+        self.chain.set_available([e for e in entries if e.kind == "upscale"])
+        current = _combo_value(self.interp_model) if self.interp_model.count() else ""
+        self.interp_model.blockSignals(True)
+        self.interp_model.clear()
+        for e in entries:
+            if e.kind == "interpolation":
+                self.interp_model.addItem(e.name, e.spec)
+                self.interp_model.setItemData(self.interp_model.count() - 1, str(e.path), Qt.ToolTipRole)
+        for b in BUILTIN_INTERPOLATORS:
+            self.interp_model.addItem(b, b)
+        if current:
+            _set_model_combo(self.interp_model, current)
+        self.interp_model.blockSignals(False)
         self.log(f"Found {len(entries)} model file(s) in: "
                  + ", ".join(str(d) for d in model_dirs(self._extra_model_dirs()) if d.is_dir()))
 
@@ -784,10 +935,10 @@ class MainWindow(QMainWindow):
             return
         cfg = self.config_from_ui()
         if not [s for s in cfg.models if s.enabled]:
-            self.view.set_message("Add at least one model to the chain")
+            self.view.set_message("Add at least one upscaling model to the chain (or use Preview in-between)")
             return
         self._preview_busy = True
-        self.preview_btn.setEnabled(False)
+        self._set_preview_buttons(False)
         self.view.set_message("Upscaling preview…")
         self.status.setText("Rendering preview…")
         w = PreviewWorker(path, self._preview_time(), cfg, self.cache)
@@ -796,6 +947,40 @@ class MainWindow(QMainWindow):
         w.failed.connect(self._preview_failed)
         w.finished.connect(self._preview_done)
         self._start_worker(w)
+
+    def run_interp_preview(self) -> None:
+        if self._preview_busy or self._job is not None:
+            return
+        path = self.queue.current_path()
+        if not path:
+            self.view.set_message("Add an input video first")
+            return
+        cfg = self.config_from_ui()
+        if not cfg.interpolating:
+            self.view.set_message("Enable frame interpolation and pick a model in the Interpolation tab")
+            return
+        self._preview_busy = True
+        self._set_preview_buttons(False)
+        self.view.set_message("Interpolating preview…")
+        self.status.setText("Rendering in-between preview…")
+        w = InterpPreviewWorker(path, self._preview_time(), cfg, self.cache)
+        w.log.connect(self.log)
+        w.ready.connect(self._interp_preview_ready)
+        w.failed.connect(self._preview_failed)
+        w.finished.connect(self._preview_done)
+        self._start_worker(w)
+
+    def _interp_preview_ready(self, blend, mid, seconds) -> None:
+        self._last_preview = mid
+        self.view.set_images(blend, mid, ("Cross-fade", "Interpolated"))
+        self.preview_info.setText(
+            f"Midpoint between two consecutive frames, {mid.shape[1]}×{mid.shape[0]}, in {seconds:.2f}s "
+            "(left: plain cross-fade, right: interpolation model)"
+        )
+
+    def _set_preview_buttons(self, enabled: bool) -> None:
+        self.preview_btn.setEnabled(enabled)
+        self.interp_preview_btn.setEnabled(enabled)
 
     def _preview_ready(self, before, after, seconds) -> None:
         self._last_preview = after
@@ -811,7 +996,7 @@ class MainWindow(QMainWindow):
 
     def _preview_done(self) -> None:
         self._preview_busy = False
-        self.preview_btn.setEnabled(self._job is None)
+        self._set_preview_buttons(self._job is None)
         self.status.setText("Ready")
 
     def save_preview(self) -> None:
@@ -835,8 +1020,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Nothing to do", "Add at least one input file.")
             return
         cfg = self.config_from_ui()
-        if not [s for s in cfg.models if s.enabled]:
-            QMessageBox.information(self, "No model", "Add at least one model to the chain.")
+        if not cfg.has_work():
+            QMessageBox.information(
+                self, "Nothing to do", "Add an upscaling model to the chain and/or enable frame interpolation."
+            )
             return
         out_dir = self.out_dir.text().strip() or None
         jobs = [(p, str(default_output_path(p, cfg, out_dir))) for p in inputs]
@@ -853,7 +1040,7 @@ class MainWindow(QMainWindow):
         for i in range(len(jobs)):
             self.queue.set_status(i, "queued")
         self.start_btn.setEnabled(False)
-        self.preview_btn.setEnabled(False)
+        self._set_preview_buttons(False)
         self.cancel_btn.setEnabled(True)
         self.progress.setValue(0)
         self._persist()
@@ -888,7 +1075,7 @@ class MainWindow(QMainWindow):
     def _on_jobs_done(self) -> None:
         self._job = None
         self.start_btn.setEnabled(True)
-        self.preview_btn.setEnabled(True)
+        self._set_preview_buttons(True)
         self.cancel_btn.setEnabled(False)
         self.status.setText("Finished")
 

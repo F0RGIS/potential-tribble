@@ -14,6 +14,7 @@ from typing import Callable, Dict, Optional
 from .models.registry import USER_DIR
 
 _RE = "https://github.com/xinntao/Real-ESRGAN/releases/download"
+_RIFE = "https://github.com/HolyWu/vs-rife/releases/download/model"
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class CatalogModel:
     url: str
     scale: int
     description: str
+    kind: str = "upscale"
 
 
 CATALOG: Dict[str, CatalogModel] = {
@@ -42,6 +44,12 @@ CATALOG: Dict[str, CatalogModel] = {
         CatalogModel("realesr-general-wdn-x4v3", "realesr-general-wdn-x4v3.pth",
                      f"{_RE}/v0.2.5.0/realesr-general-wdn-x4v3.pth", 4,
                      "Real-ESRGAN general x4 v3, stronger denoise (compact SRVGG, BSD-3)"),
+        CatalogModel("rife-v4.26", "flownet_v4.26.pkl", f"{_RIFE}/flownet_v4.26.pkl", 1,
+                     "RIFE v4.26 frame interpolation, latest general model (MIT)", "interpolation"),
+        CatalogModel("rife-v4.22-lite", "flownet_v4.22.lite.pkl", f"{_RIFE}/flownet_v4.22.lite.pkl", 1,
+                     "RIFE v4.22 lite frame interpolation, fast, good for animation (MIT)", "interpolation"),
+        CatalogModel("rife-v4.6", "flownet_v4.6.pkl", f"{_RIFE}/flownet_v4.6.pkl", 1,
+                     "RIFE v4.6 frame interpolation, classic, supports ensemble (MIT)", "interpolation"),
     ]
 }
 

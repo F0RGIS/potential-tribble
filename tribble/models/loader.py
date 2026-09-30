@@ -99,6 +99,7 @@ def load_model(
     else:
         if plugins is None:
             plugins = load_plugins(plugin_dirs())
+        plugins = {k: p for k, p in plugins.items() if p.kind == "upscale"}
         model = _load_torch(path, dev, use_half, allow_unsafe_pickle, sidecar, plugins)
 
     _apply_sidecar(model, sidecar, path)
