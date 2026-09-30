@@ -1,0 +1,12 @@
+{
+  "models": [
+    {"model": "~/.tribble/models/realesr-animevideov3.pth", "strength": 1.0}
+  ],
+  "processing": {"device": "auto", "half_precision": true, "tile_size": 0, "tile_overlap": 16, "bit_depth": 8},
+  "input": {"pre_filters": ""},
+  "output": {
+    "size_mode": "height", "height": 2160, "resize_filter": "lanczos",
+    "container": "mkv", "codec": "libx265", "crf": 20, "preset": "slow",
+    "pixel_format": "yuv420p10le", "copy_audio": true, "copy_subtitles": true
+  }
+}
